@@ -2,7 +2,11 @@
 Translates from OpenAI's `/v1/chat/completions` to DeepSeek's `/v1/chat/completions`
 """
 
+from collections import OrderedDict
 from collections.abc import Coroutine, Mapping, Sequence
+from hashlib import sha256
+from json import dumps
+from threading import Lock
 from typing import Any, Final, Literal, cast, overload
 
 import litellm
@@ -15,6 +19,71 @@ from litellm.types.llms.openai import AllMessageValues
 from litellm.utils import supports_reasoning, supports_vision
 
 from ...openai.chat.gpt_transformation import OpenAIGPTConfig
+
+_EMPTY_REASONING_WARN_CACHE_SIZE: Final = 4096
+_FINGERPRINT_TRANSPORT_KEYS: Final = frozenset({"cache_control", "provider_specific_fields"})
+_empty_reasoning_warn_seen: Final = OrderedDict[str, None]()
+_empty_reasoning_warn_lock: Final = Lock()
+
+
+def _fingerprint_value(value: object) -> object:
+    """Strip transport metadata at any depth so it cannot change message identity."""
+    if isinstance(value, Mapping):
+        fields: Final = cast(Mapping[str, object], value)  # cast-ok: runtime JSON mappings
+        return {
+            key: _fingerprint_value(nested) for key, nested in fields.items() if key not in _FINGERPRINT_TRANSPORT_KEYS
+        }
+    if isinstance(value, (list, tuple)):
+        items: Final = cast(Sequence[object], value)  # cast-ok: runtime JSON arrays
+        return [_fingerprint_value(item) for item in items]
+    return value
+
+
+def _reasoning_warning_fingerprint(message: AllMessageValues) -> str:
+    """Stable identity for deduplicating warnings about one assistant turn.
+
+    Only model-visible fields are hashed. Transport metadata such as
+    `provider_specific_fields` or `cache_control` is stripped at any depth so
+    it cannot make the same turn look new and evict the warning.
+    """
+    fields: Final = cast(Mapping[str, object], message)  # cast-ok: TypedDict union read
+    projection: Final = _fingerprint_value(
+        {
+            "role": fields.get("role"),
+            "content": fields.get("content"),
+            "tool_calls": fields.get("tool_calls"),
+            "function_call": fields.get("function_call"),
+            "name": fields.get("name"),
+            "reasoning_content": fields.get("reasoning_content"),
+        }
+    )
+    serialized: Final = dumps(projection, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(serialized.encode()).hexdigest()
+
+
+def clear_empty_reasoning_warnings() -> None:
+    """Reset the process-wide once-only warning cache."""
+    with _empty_reasoning_warn_lock:
+        _empty_reasoning_warn_seen.clear()
+
+
+def _warn_empty_reasoning_once(fingerprint: str) -> None:
+    """Log once per distinct message, including when calls arrive concurrently."""
+    with _empty_reasoning_warn_lock:
+        if fingerprint in _empty_reasoning_warn_seen:
+            _empty_reasoning_warn_seen.move_to_end(fingerprint)
+            return
+        _empty_reasoning_warn_seen[fingerprint] = None
+        if len(_empty_reasoning_warn_seen) > _EMPTY_REASONING_WARN_CACHE_SIZE:
+            _empty_reasoning_warn_seen.popitem(last=False)
+    litellm.verbose_logger.warning(
+        "DeepSeek thinking mode: assistant message carries an explicit empty "
+        "`reasoning_content` (message fingerprint %s). A single-space placeholder "
+        "is being injected so the provider receives a non-empty chain field. The "
+        "model will receive a blank reasoning chain for this turn. This is expected "
+        "when the model returned no reasoning; each distinct message is logged once.",
+        fingerprint[:12],
+    )
 
 
 class DeepSeekChatConfig(OpenAIGPTConfig):
@@ -68,14 +137,19 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
         the API returns:
           "The reasoning_content in the thinking mode must be passed back to the API."
 
-        For each assistant message that is missing `reasoning_content`:
+        For each assistant message that has no `reasoning_content`:
           1. Promote it from `provider_specific_fields["reasoning_content"]` if present
              (LiteLLM stores provider-specific response fields there).
-          2. Otherwise inject a single space — the minimum value the API accepts.
+          2. Otherwise inject a single space, the minimum value the API accepts.
+
+        An explicit empty string means the client already reported that the turn
+        had no reasoning chain, so that warning is deduplicated per message. A
+        genuinely absent field still warns on every request, since that usually
+        means the caller dropped a chain it had.
         """
         result: Final[list[AllMessageValues]] = []
         for msg in messages:
-            if msg.get("role") == "assistant" and not msg.get("reasoning_content"):
+            if msg.get("role") == "assistant" and not (reasoning_content := msg.get("reasoning_content")):
                 patched = dict(cast(dict, msg))
                 provider_fields = patched.get("provider_specific_fields") or {}
                 stored = provider_fields.get("reasoning_content")
@@ -85,16 +159,19 @@ class DeepSeekChatConfig(OpenAIGPTConfig):
                     cleaned.pop("reasoning_content", None)
                     patched["provider_specific_fields"] = cleaned
                 else:
-                    litellm.verbose_logger.warning(
-                        "DeepSeek thinking mode: assistant message is missing "
-                        "`reasoning_content` and none was saved in "
-                        "`provider_specific_fields`. A single-space placeholder "
-                        "is being injected to satisfy API validation, but the "
-                        "model will receive a blank reasoning chain for this turn, "
-                        "which may silently degrade multi-turn response quality. "
-                        "Preserve `reasoning_content` from the original assistant "
-                        "response when building multi-turn conversation history."
-                    )
+                    if reasoning_content == "":
+                        _warn_empty_reasoning_once(_reasoning_warning_fingerprint(msg))
+                    else:
+                        litellm.verbose_logger.warning(
+                            "DeepSeek thinking mode: assistant message is missing "
+                            "`reasoning_content` and none was saved in "
+                            "`provider_specific_fields`. A single-space placeholder "
+                            "is being injected to satisfy API validation, but the "
+                            "model will receive a blank reasoning chain for this turn, "
+                            "which may silently degrade multi-turn response quality. "
+                            "Preserve `reasoning_content` from the original assistant "
+                            "response when building multi-turn conversation history."
+                        )
                     patched["reasoning_content"] = " "
                 result.append(cast(AllMessageValues, patched))
             else:

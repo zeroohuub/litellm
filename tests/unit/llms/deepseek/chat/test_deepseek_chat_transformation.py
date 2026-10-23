@@ -1,5 +1,11 @@
+import copy
+from threading import Event, Lock, Thread
+from unittest.mock import Mock, patch
+
+import pytest
+
 import litellm
-from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
+from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig, clear_empty_reasoning_warnings
 
 
 def _function_tool(name: str) -> dict:
@@ -564,3 +570,193 @@ class TestDeepSeekThinkingParams:
         assert result["tools"] == [{"type": "function", "function": {"name": "get_weather"}}]
         assert "tool_choice" not in result
         assert result["parallel_tool_calls"] is True
+
+
+def _empty_reasoning_message(call_id: str, content: str | list[dict] | None = None) -> dict:
+    return {
+        "role": "assistant",
+        "content": content,
+        "reasoning_content": "",
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "shell", "arguments": "{}"},
+            }
+        ],
+    }
+
+
+def _tool_result(call_id: str) -> dict:
+    return {"role": "tool", "tool_call_id": call_id, "content": "ok"}
+
+
+def _transform(config: DeepSeekChatConfig, messages: list[dict]) -> dict:
+    return config.transform_request(
+        model="deepseek-reasoner",
+        messages=copy.deepcopy(messages),
+        optional_params={"thinking": {"type": "enabled"}},
+        litellm_params={},
+        headers={},
+    )
+
+
+def _reasoning_warnings(mock_warning: Mock) -> list:
+    return [call for call in mock_warning.call_args_list if "DeepSeek thinking mode" in str(call.args[0])]
+
+
+class TestDeepSeekEmptyReasoningWarning:
+    """An explicit empty chain is normal for the model, so warn once per turn, not per replay."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_warning_cache(self):
+        clear_empty_reasoning_warnings()
+        yield
+        clear_empty_reasoning_warnings()
+
+    def test_replayed_history_warns_once_per_message(self):
+        config = DeepSeekChatConfig()
+        messages = [
+            {"role": "user", "content": "Read replay.txt"},
+            _empty_reasoning_message("call_replay"),
+            _tool_result("call_replay"),
+        ]
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            first = _transform(config, messages)
+            second = _transform(config, messages)
+
+        assert len(_reasoning_warnings(mock_warning)) == 1
+        assert first["messages"][1]["reasoning_content"] == " "
+        assert second["messages"][1]["reasoning_content"] == " "
+
+    def test_new_empty_message_warns_again(self):
+        config = DeepSeekChatConfig()
+        first_messages = [
+            {"role": "user", "content": "Read first.txt"},
+            _empty_reasoning_message("call_first"),
+            _tool_result("call_first"),
+        ]
+        second_messages = [
+            {"role": "user", "content": "Read second.txt"},
+            _empty_reasoning_message("call_second"),
+            _tool_result("call_second"),
+        ]
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            _transform(config, first_messages)
+            _transform(config, second_messages)
+
+        assert len(_reasoning_warnings(mock_warning)) == 2
+
+    def test_dropped_chain_warns_when_message_turns_empty(self):
+        config = DeepSeekChatConfig()
+        assistant = _empty_reasoning_message("call_dropped")
+        assistant["reasoning_content"] = "I should read the file first."
+        messages = [
+            {"role": "user", "content": "Read dropped.txt"},
+            assistant,
+            _tool_result("call_dropped"),
+        ]
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            _transform(config, messages)
+            assistant["reasoning_content"] = ""
+            _transform(config, messages)
+
+        assert len(_reasoning_warnings(mock_warning)) == 1
+
+    def test_absent_field_still_warns_on_every_request(self):
+        config = DeepSeekChatConfig()
+        assistant = _empty_reasoning_message("call_absent")
+        del assistant["reasoning_content"]
+        messages = [
+            {"role": "user", "content": "Read absent.txt"},
+            assistant,
+            _tool_result("call_absent"),
+        ]
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            _transform(config, messages)
+            _transform(config, messages)
+
+        assert len(_reasoning_warnings(mock_warning)) == 2
+
+    def test_stored_reasoning_is_promoted_without_warning(self):
+        config = DeepSeekChatConfig()
+        assistant = _empty_reasoning_message("call_stored")
+        assistant["provider_specific_fields"] = {"reasoning_content": "stored chain"}
+        messages = [
+            {"role": "user", "content": "Read stored.txt"},
+            assistant,
+            _tool_result("call_stored"),
+        ]
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            body = _transform(config, messages)
+
+        assert len(_reasoning_warnings(mock_warning)) == 0
+        assert body["messages"][1]["reasoning_content"] == "stored chain"
+        assert "reasoning_content" not in body["messages"][1]["provider_specific_fields"]
+
+    def test_nested_transport_metadata_does_not_change_identity(self):
+        config = DeepSeekChatConfig()
+        plain = _empty_reasoning_message("call_metadata", content=[{"type": "text", "text": "checking"}])
+        decorated = copy.deepcopy(plain)
+        decorated["content"][0]["cache_control"] = {"type": "ephemeral"}
+        decorated["tool_calls"][0]["provider_specific_fields"] = {"trace": "abc"}
+        base = {"role": "user", "content": "Read metadata.txt"}
+
+        with patch.object(litellm.verbose_logger, "warning") as mock_warning:
+            _transform(config, [base, plain, _tool_result("call_metadata")])
+            _transform(config, [base, decorated, _tool_result("call_metadata")])
+
+        assert len(_reasoning_warnings(mock_warning)) == 1
+
+    def test_concurrent_calls_warn_once(self):
+        config = DeepSeekChatConfig()
+        messages = [
+            {"role": "user", "content": "Read concurrent.txt"},
+            _empty_reasoning_message("call_concurrent"),
+            _tool_result("call_concurrent"),
+        ]
+        entered_log = Event()
+        release_log = Event()
+        second_done = Event()
+        records: list[str] = []
+        record_lock = Lock()
+
+        def record(message: str, *args: object) -> None:
+            with record_lock:
+                records.append(message)
+                is_first = len(records) == 1
+            if is_first:
+                entered_log.set()
+                release_log.wait(timeout=5)
+
+        def run_once() -> None:
+            _transform(config, messages)
+
+        def run_second() -> None:
+            try:
+                run_once()
+            finally:
+                second_done.set()
+
+        first_thread = Thread(target=run_once, daemon=True)
+        second_thread: Thread | None = None
+
+        with patch.object(litellm.verbose_logger, "warning", record):
+            first_thread.start()
+            try:
+                assert entered_log.wait(timeout=5), "first call never reached the logger"
+                second_thread = Thread(target=run_second, daemon=True)
+                second_thread.start()
+                assert second_done.wait(timeout=5), "second call blocked behind the first"
+            finally:
+                release_log.set()
+                first_thread.join(timeout=5)
+                if second_thread is not None:
+                    second_thread.join(timeout=5)
+
+        assert len([message for message in records if "DeepSeek thinking mode" in message]) == 1
