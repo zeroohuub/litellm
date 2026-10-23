@@ -27,7 +27,6 @@ from litellm.types.utils import LlmProviders
 from ..authenticator import resolve_chatgpt_credentials
 from ..common_utils import (
     ChatGPTAuthError,
-    ensure_chatgpt_session_id,
     get_chatgpt_api_base,
     get_chatgpt_default_headers,
     get_chatgpt_default_instructions,
@@ -48,7 +47,7 @@ UNSUPPORTED_CHATGPT_RESPONSES_PARAMS: Final = frozenset(
 
 PROMPT_CACHE_KEY_MAX_LENGTH: Final = 64
 
-INPUT_ADAPTER: Final[TypeAdapter[str | list[object]]] = TypeAdapter(str | list[object])
+INPUT_ADAPTER: Final[TypeAdapter[str | Sequence[object]]] = TypeAdapter(str | Sequence[object])
 
 
 def _input_items(input_value: str | Sequence[object]) -> Sequence[object]:
@@ -77,7 +76,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
     ) -> dict:
         configured_api_key: Final = litellm_params.api_key if litellm_params else None
         access_token, account_id = self._resolve_credentials(configured_api_key=configured_api_key, model=model)
-        session_id: Final = ensure_chatgpt_session_id(litellm_params)
+        session_id: Final = get_chatgpt_session_id(litellm_params)
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
         return {**default_headers, **headers}
 
@@ -113,8 +112,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         request.setdefault("parallel_tool_calls", True)
         request.setdefault("text", {"verbosity": "low"})
         session_id: Final = get_chatgpt_session_id(litellm_params)
-        if session_id:
-            request.setdefault("prompt_cache_key", session_id[:PROMPT_CACHE_KEY_MAX_LENGTH])
+        if not isinstance(request.get("prompt_cache_key"), str) and session_id:
+            request["prompt_cache_key"] = session_id[:PROMPT_CACHE_KEY_MAX_LENGTH]
         include: Final = list(request.get("include") or [])
         if "reasoning.encrypted_content" not in include:
             include.append("reasoning.encrypted_content")

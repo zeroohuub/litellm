@@ -7,8 +7,8 @@ from litellm.types.llms.openai import AllMessageValues
 from ..authenticator import Authenticator, resolve_chatgpt_credentials
 from ..common_utils import (
     ChatGPTAuthError,
-    ensure_chatgpt_session_id,
     get_chatgpt_default_headers,
+    get_chatgpt_session_id,
 )
 from .streaming_utils import ChatGPTToolCallNormalizer
 
@@ -50,7 +50,7 @@ class ChatGPTConfig(OpenAIConfig):
             headers, model, messages, optional_params, litellm_params, access_token, api_base
         )
 
-        session_id: Final = ensure_chatgpt_session_id(litellm_params)
+        session_id: Final = get_chatgpt_session_id(litellm_params)
         default_headers: Final = get_chatgpt_default_headers(access_token, account_id, session_id)
         return {**default_headers, **validated_headers}
 

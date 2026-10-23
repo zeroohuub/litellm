@@ -8,6 +8,8 @@ from litellm.llms.chatgpt.common_utils import (
     PINNED_CODEX_VERSION,
     _normalize_os_version,
     get_chatgpt_codex_version,
+    get_chatgpt_default_headers,
+    get_chatgpt_session_id,
     get_chatgpt_user_agent,
 )
 
@@ -76,10 +78,52 @@ def test_user_agent_version_override_cannot_break_the_header(monkeypatch):
     assert USER_AGENT_PATTERN.match(user_agent) is not None, user_agent
 
 
-def test_user_agent_os_segment_is_the_distro_not_the_kernel(monkeypatch):
-    user_agent = _user_agent(monkeypatch, {})
+def test_linux_os_segment_uses_the_distro_name_and_version(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(platform, "release", lambda: "6.12.113+deb13-amd64")
+    monkeypatch.setattr(
+        platform,
+        "freedesktop_os_release",
+        lambda: {"NAME": "Debian GNU/Linux", "VERSION_ID": "13"},
+    )
+    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
 
-    assert platform.release() not in user_agent
+    user_agent = get_chatgpt_user_agent("codex_cli_rs")
+
+    assert "(Debian 13.0.0; x86_64)" in user_agent
+    assert "deb13" not in user_agent
+
+
+def test_linux_os_segment_falls_back_to_linux_without_os_release(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+    def _raise() -> dict[str, str]:
+        raise OSError("no os-release")
+
+    monkeypatch.setattr(platform, "freedesktop_os_release", _raise)
+    monkeypatch.setattr(platform, "machine", lambda: "aarch64")
+
+    assert "(Linux Unknown; aarch64)" in get_chatgpt_user_agent("codex_cli_rs")
+
+
+def test_macos_os_segment(monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "mac_ver", lambda: ("15.6.1", ("", "", ""), ""))
+    monkeypatch.setattr(platform, "machine", lambda: "arm64")
+
+    assert "(Mac OS 15.6.1; arm64)" in get_chatgpt_user_agent("codex_cli_rs")
+
+
+@pytest.mark.parametrize(
+    ("machine", "expected"),
+    [("AMD64", "x86_64"), ("ARM64", "aarch64"), ("x86", "i386")],
+)
+def test_windows_os_segment_maps_the_cpu_architecture(monkeypatch, machine: str, expected: str):
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(platform, "version", lambda: "10.0.19045")
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+
+    assert f"(Windows 10.0.19045; {expected})" in get_chatgpt_user_agent("codex_cli_rs")
 
 
 @pytest.mark.parametrize(
@@ -170,3 +214,24 @@ def test_user_agent_override_short_circuits(monkeypatch):
     monkeypatch.setenv("CHATGPT_USER_AGENT", "custom-agent/1.0")
 
     assert get_chatgpt_user_agent("codex_cli_rs") == "custom-agent/1.0"
+
+
+def test_session_id_is_not_derived_from_per_request_trace_ids():
+    assert get_chatgpt_session_id({"litellm_trace_id": "trace-a"}) is None
+    assert get_chatgpt_session_id({"litellm_call_id": "call-a"}) is None
+
+
+def test_no_session_header_is_fabricated_without_a_conversation_identity():
+    headers = get_chatgpt_default_headers("access", "acct", None)
+
+    assert "session-id" not in headers
+    assert "thread-id" not in headers
+    assert "x-client-request-id" not in headers
+
+
+def test_conversation_identity_reaches_every_session_header():
+    headers = get_chatgpt_default_headers("access", "acct", get_chatgpt_session_id({"litellm_session_id": "conv-1"}))
+
+    assert headers["session-id"] == "conv-1"
+    assert headers["thread-id"] == "conv-1"
+    assert headers["x-client-request-id"] == "conv-1"

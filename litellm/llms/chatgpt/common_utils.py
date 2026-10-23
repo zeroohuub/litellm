@@ -4,12 +4,15 @@ Constants and helpers for ChatGPT subscription OAuth.
 
 import os
 import platform
-from typing import Any, Final
-from uuid import uuid4
+from collections.abc import Mapping
+from typing import Final
 
 import httpx
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
+
+PARAMS_ADAPTER: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
 
 # OAuth + API constants (derived from openai/codex)
 CHATGPT_AUTH_BASE: Final = "https://auth.openai.com"
@@ -28,20 +31,20 @@ PINNED_CODEX_VERSION: Final = "0.163.0"
 class ChatGPTAuthError(BaseLLMException):
     def __init__(
         self,
-        status_code,
-        message,
+        status_code: int,
+        message: str,
         request: httpx.Request | None = None,
         response: httpx.Response | None = None,
-        headers: httpx.Headers | dict | None = None,
-        body: dict | None = None,
+        headers: Mapping[str, str] | None = None,
+        body: Mapping[str, object] | None = None,
     ):
-        super().__init__(
+        super().__init__(  # pyright: ignore[reportUnknownMemberType]  # BaseLLMException annotates dict without type args
             status_code=status_code,
             message=message,
             request=request,
             response=response,
-            headers=headers,
-            body=body,
+            headers=dict(headers) if headers else None,
+            body=dict(body) if body else None,
         )
 
 
@@ -232,22 +235,14 @@ def get_chatgpt_default_instructions() -> str:
     return os.getenv("CHATGPT_DEFAULT_INSTRUCTIONS", "").strip()
 
 
-def _normalize_litellm_params(litellm_params: Any | None) -> dict:
+def _normalize_litellm_params(litellm_params: object | None) -> Mapping[str, object]:
     if litellm_params is None:
         return {}
-    if isinstance(litellm_params, dict):
-        return litellm_params
-    if hasattr(litellm_params, "model_dump"):
-        try:
-            return litellm_params.model_dump()
-        except Exception:
-            return {}
-    if hasattr(litellm_params, "dict"):
-        try:
-            return litellm_params.dict()
-        except Exception:
-            return {}
-    return {}
+    dumped: Final = litellm_params.model_dump() if isinstance(litellm_params, BaseModel) else litellm_params
+    try:
+        return PARAMS_ADAPTER.validate_python(dumped)
+    except ValidationError:
+        return {}
 
 
 def get_chatgpt_session_id(litellm_params: object) -> str | None:
@@ -257,16 +252,8 @@ def get_chatgpt_session_id(litellm_params: object) -> str | None:
         if value:
             return str(value)
     metadata: Final = params.get("metadata")
-    if isinstance(metadata, dict):
-        value = metadata.get("session_id")
-        if value:
-            return str(value)
-    for key in ("litellm_trace_id", "litellm_call_id"):
-        value = params.get(key)
+    if isinstance(metadata, Mapping):
+        value = PARAMS_ADAPTER.validate_python(metadata).get("session_id")
         if value:
             return str(value)
     return None
-
-
-def ensure_chatgpt_session_id(litellm_params: object) -> str:
-    return get_chatgpt_session_id(litellm_params) or str(uuid4())
