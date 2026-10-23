@@ -3,16 +3,17 @@ import copy
 import json
 import os
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Final
+from typing import Final, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from botocore.credentials import Credentials
 from fastapi import Request
 from opentelemetry.trace import INVALID_SPAN, NonRecordingSpan, SpanContext
-from pydantic import ValidationError as PydanticValidationError
+from pydantic import TypeAdapter, ValidationError as PydanticValidationError
 from starlette.datastructures import Headers
 
 import litellm
@@ -3424,20 +3425,34 @@ def test_get_chain_id_from_headers_codex_unprefixed_session_id(header: str):
     assert get_chain_id_from_headers({"user-agent": CODEX_USER_AGENT, header: CODEX_SESSION_UUID}) == CODEX_SESSION_UUID
 
 
-@pytest.mark.parametrize(
-    "user_agent",
-    ["curl/8.7.1", "claude-cli/2.1.0 (external, cli)", "OpenAI/Python 1.0.0"],
-)
-def test_get_chain_id_from_headers_unprefixed_session_id_requires_codex(user_agent: str):
-    """An unprefixed session-id from a non-Codex caller must not group traces.
-
-    The name is generic enough that two unrelated callers could collide on a value
-    and have their sessions merged, so the bare-header path is Codex-only.
-    """
+@pytest.mark.parametrize("header", ("session_id", "session-id", "Session_Id", "Session-Id"))
+@pytest.mark.parametrize("user_agent", ("pi (linux 6.12; x64)", "pi (browser)", "PI (Windows_NT; x64)"))
+def test_get_chain_id_from_headers_pi_session_id(user_agent: str, header: str) -> None:
     from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
 
-    assert get_chain_id_from_headers({"user-agent": user_agent, "session-id": CODEX_SESSION_UUID}) is None
-    assert get_chain_id_from_headers({"session-id": CODEX_SESSION_UUID}) is None
+    session_id: Final = "11111111-2222-4333-8444-555555555555"
+    assert get_chain_id_from_headers({"User-Agent": user_agent, header: session_id}) == session_id
+
+
+@pytest.mark.parametrize("header", ("session_id", "session-id"))
+@pytest.mark.parametrize(
+    "user_agent",
+    (
+        "curl/8.7.1",
+        "claude-cli/2.1.0 (external, cli)",
+        "OpenAI/Python 1.0.0",
+        "pico/1.0",
+        "pi-helper/1.0",
+        "not-pi (linux; x64)",
+        "client pi (browser)",
+    ),
+)
+def test_get_chain_id_from_headers_unprefixed_session_id_requires_known_agent(user_agent: str, header: str) -> None:
+    """Unprefixed session headers from unrelated clients must not group traces"""
+    from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
+
+    assert get_chain_id_from_headers({"user-agent": user_agent, header: CODEX_SESSION_UUID}) is None
+    assert get_chain_id_from_headers({header: CODEX_SESSION_UUID}) is None
 
 
 def test_get_chain_id_from_headers_codex_prefers_session_over_thread():
@@ -3455,32 +3470,45 @@ def test_get_chain_id_from_headers_codex_prefers_session_over_thread():
     )
 
 
-def test_get_chain_id_from_headers_codex_ignores_implausible_value():
+@pytest.mark.parametrize("value", ("short", "has spaces!!", ""))
+@pytest.mark.parametrize("user_agent, header", ((CODEX_USER_AGENT, "session-id"), ("pi (browser)", "session_id")))
+def test_get_chain_id_from_headers_coding_agent_ignores_implausible_value(user_agent: str, header: str, value: str) -> None:
     from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
 
-    assert get_chain_id_from_headers({"user-agent": CODEX_USER_AGENT, "session-id": "short"}) is None
-    assert get_chain_id_from_headers({"user-agent": CODEX_USER_AGENT, "session-id": "has spaces!!"}) is None
+    assert get_chain_id_from_headers({"user-agent": user_agent, header: value}) is None
 
 
-def test_get_chain_id_from_headers_explicit_beats_codex_header():
+@pytest.mark.parametrize("header", ("x-client-request-id", "thread-id", "conversation_id"))
+def test_get_chain_id_from_headers_pi_ignores_other_identifiers(header: str) -> None:
+    from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
+
+    assert get_chain_id_from_headers({"user-agent": "pi (browser)", header: CODEX_SESSION_UUID}) is None
+
+
+@pytest.mark.parametrize("specific_header", ("x-litellm-trace-id", "x-litellm-session-id", "x-parent-session-id"))
+@pytest.mark.parametrize("user_agent, header", ((CODEX_USER_AGENT, "session-id"), ("pi (browser)", "session_id")))
+def test_get_chain_id_from_headers_specific_beats_coding_agent_header(
+    user_agent: str, header: str, specific_header: str
+) -> None:
     from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
 
     assert (
         get_chain_id_from_headers(
             {
-                "user-agent": CODEX_USER_AGENT,
-                "x-litellm-trace-id": "explicit-id-value",
-                "session-id": CODEX_SESSION_UUID,
+                "user-agent": user_agent,
+                specific_header: "explicit-id-value",
+                header: CODEX_SESSION_UUID,
             }
         )
         == "explicit-id-value"
     )
 
 
-def test_add_litellm_metadata_groups_codex_turns_into_one_session():
-    """Every turn of a Codex session must log under one session id, not a fresh per-call trace id."""
-    headers = {"user-agent": CODEX_USER_AGENT, "session-id": CODEX_SESSION_UUID}
-    turns = [{"litellm_metadata": {}}, {"litellm_metadata": {}}]
+@pytest.mark.parametrize("user_agent, header", ((CODEX_USER_AGENT, "session-id"), ("pi (browser)", "session_id")))
+def test_add_litellm_metadata_groups_coding_agent_turns_into_one_session(user_agent: str, header: str) -> None:
+    """Turns from the same coding-agent session must share a session id"""
+    headers: Final = {"user-agent": user_agent, header: CODEX_SESSION_UUID}
+    turns: Final[tuple[dict[str, object], ...]] = ({"litellm_metadata": {}}, {"litellm_metadata": {}})
     for turn in turns:
         LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
             headers=headers, data=turn, _metadata_variable_name="litellm_metadata"
@@ -3489,7 +3517,44 @@ def test_add_litellm_metadata_groups_codex_turns_into_one_session():
     for turn in turns:
         assert turn["litellm_session_id"] == CODEX_SESSION_UUID
         assert turn["litellm_trace_id"] == CODEX_SESSION_UUID
-        assert turn["litellm_metadata"]["session_id"] == CODEX_SESSION_UUID
+        assert TypeAdapter(dict[str, str]).validate_python(turn["litellm_metadata"])["session_id"] == CODEX_SESSION_UUID
+
+
+@pytest.mark.parametrize("session_header", ("session_id", "session-id"))
+@pytest.mark.parametrize("metadata_key", ("metadata", "litellm_metadata"))
+def test_pi_session_id_reaches_chatgpt_headers(session_header: str, metadata_key: str) -> None:
+    from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+    from litellm.types.router import GenericLiteLLMParams
+
+    session_id: Final = "11111111-2222-4333-8444-555555555555"
+    data: Final[dict[str, object]] = {metadata_key: {}}
+    attach_metadata: Final = cast(
+        Callable[[dict[str, str], dict[str, object], str], object],
+        LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers,
+    )
+    attach_metadata(
+        {
+            "User-Agent": "pi (linux 6.12; x64)",
+            session_header: session_id,
+            "x-client-request-id": "per-request-id",
+        },
+        data,
+        metadata_key,
+    )
+    params: Final = GenericLiteLLMParams.model_validate({**data, "api_key": "sk-test-pi-session"})
+    validate_environment: Final = cast(
+        Callable[[dict[str, str], str, GenericLiteLLMParams], object],
+        ChatGPTResponsesAPIConfig().validate_environment,
+    )
+    upstream_headers: Final = TypeAdapter(dict[str, str]).validate_python(
+        validate_environment({}, "test-chatgpt-model", params)
+    )
+
+    assert data["litellm_session_id"] == session_id
+    assert TypeAdapter(dict[str, str]).validate_python(data[metadata_key])["session_id"] == session_id
+    assert upstream_headers["session-id"] == session_id
+    assert upstream_headers["thread-id"] == session_id
+    assert upstream_headers["x-client-request-id"] == session_id
 
 
 OPENCODE_SESSION_ID = "ses_f91e6e825ffeuhlu5EbglxjAN2"
