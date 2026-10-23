@@ -1,7 +1,8 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
+from pydantic import TypeAdapter
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -30,7 +31,31 @@ from ..common_utils import (
     get_chatgpt_api_base,
     get_chatgpt_default_headers,
     get_chatgpt_default_instructions,
+    get_chatgpt_session_id,
 )
+
+UNSUPPORTED_CHATGPT_RESPONSES_PARAMS: Final = frozenset(
+    {
+        "user",
+        "temperature",
+        "top_p",
+        "context_management",
+        "metadata",
+        "max_output_tokens",
+        "stream_options",
+    }
+)
+
+PROMPT_CACHE_KEY_MAX_LENGTH: Final = 64
+
+INPUT_ADAPTER: Final[TypeAdapter[str | list[object]]] = TypeAdapter(str | list[object])
+
+
+def _input_items(input_value: str | Sequence[object]) -> Sequence[object]:
+    if isinstance(input_value, str):
+        return [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": input_value}]}]
+    return input_value
+
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
@@ -82,35 +107,37 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
-        base_instructions: Final = get_chatgpt_default_instructions()
-        existing_instructions: Final = request.get("instructions")
-        if existing_instructions:
-            if base_instructions not in existing_instructions:
-                request["instructions"] = f"{base_instructions}\n\n{existing_instructions}"
-        else:
-            request["instructions"] = base_instructions
         request["store"] = False
         request["stream"] = True
+        request.setdefault("tool_choice", "auto")
+        request.setdefault("parallel_tool_calls", True)
+        request.setdefault("text", {"verbosity": "low"})
+        session_id: Final = get_chatgpt_session_id(litellm_params)
+        if session_id:
+            request.setdefault("prompt_cache_key", session_id[:PROMPT_CACHE_KEY_MAX_LENGTH])
         include: Final = list(request.get("include") or [])
         if "reasoning.encrypted_content" not in include:
             include.append("reasoning.encrypted_content")
         request["include"] = include
 
-        allowed_keys: Final = {
-            "model",
-            "input",
-            "instructions",
-            "stream",
-            "store",
-            "include",
-            "tools",
-            "tool_choice",
-            "reasoning",
-            "previous_response_id",
-            "truncation",
-        }
+        base_instructions: Final = get_chatgpt_default_instructions()
+        raw_instructions: Final = request.get("instructions")
+        caller_instructions: Final = raw_instructions if isinstance(raw_instructions, str) else None
+        if caller_instructions is not None:
+            del request["instructions"]
+        base_text: Final = "\n\n".join(part for part in (base_instructions, caller_instructions) if part)
+        if base_text:
+            request["input"] = [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": base_text}],
+                    "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["model.base_instructions"]},
+                },
+                *_input_items(INPUT_ADAPTER.validate_python(request.get("input"))),
+            ]
 
-        return {k: v for k, v in request.items() if k in allowed_keys}
+        return {k: v for k, v in request.items() if k not in UNSUPPORTED_CHATGPT_RESPONSES_PARAMS}
 
     def transform_response_api_response(
         self,

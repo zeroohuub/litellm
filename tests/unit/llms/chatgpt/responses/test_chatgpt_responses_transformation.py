@@ -122,7 +122,10 @@ class TestChatGPTResponsesAPITransformation:
         assert headers["originator"] == "custom-origin"
         assert headers["content-type"] == "application/json"
         assert headers["accept"] == "text/event-stream"
-        assert headers["session_id"] == "session-123"
+        assert headers["session-id"] == "session-123"
+        assert headers["thread-id"] == "session-123"
+        assert headers["x-client-request-id"] == "session-123"
+        assert "session_id" not in headers
 
     @pytest.mark.parametrize(
         "model_name",
@@ -143,7 +146,83 @@ class TestChatGPTResponsesAPITransformation:
 
         assert request["stream"] is True
         assert "reasoning.encrypted_content" in request["include"]
-        assert request["instructions"].startswith("You are Codex, based on GPT-5.")
+
+    @pytest.mark.parametrize(
+        "model_name",
+        [
+            "chatgpt/gpt-5.2-codex",
+            "chatgpt/gpt-5.3-codex",
+        ],
+    )
+    def test_chatgpt_sends_no_instructions_field_by_default(self, model_name):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model=model_name,
+            input="hi",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert "instructions" not in request
+
+    def test_chatgpt_moves_caller_instructions_into_a_developer_item(self):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="gpt-6.1-sol",
+            input="hi",
+            response_api_optional_request_params={"instructions": "CUSTOM SYS"},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert "instructions" not in request
+        assert request["input"][0] == {
+            "type": "message",
+            "role": "developer",
+            "content": [{"type": "input_text", "text": "CUSTOM SYS"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["model.base_instructions"]
+            },
+        }
+        assert request["input"][1] == {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+        }
+
+    def test_chatgpt_prepends_configured_base_instructions_once(self, monkeypatch):
+        monkeypatch.setenv("CHATGPT_DEFAULT_INSTRUCTIONS", "BASE")
+        config = ChatGPTResponsesAPIConfig()
+
+        request = config.transform_responses_api_request(
+            model="gpt-6.1-sol",
+            input=[{"role": "user", "content": "hi"}],
+            response_api_optional_request_params={"instructions": "CUSTOM SYS"},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        developer_items = [item for item in request["input"] if item["role"] == "developer"]
+        assert len(developer_items) == 1
+        assert developer_items[0]["content"][0]["text"] == "BASE\n\nCUSTOM SYS"
+        assert request["input"][1] == {"role": "user", "content": "hi"}
+
+    @pytest.mark.parametrize("configured", ["", "   "])
+    def test_chatgpt_blank_base_instructions_disable_injection(self, monkeypatch, configured):
+        monkeypatch.setenv("CHATGPT_DEFAULT_INSTRUCTIONS", configured)
+        config = ChatGPTResponsesAPIConfig()
+
+        request = config.transform_responses_api_request(
+            model="gpt-6.1-sol",
+            input="hi",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert "instructions" not in request
+        assert request["input"] == "hi"
 
     @pytest.mark.parametrize(
         "model_name",
@@ -195,6 +274,41 @@ class TestChatGPTResponsesAPITransformation:
             "type": "function",
             "function": {"name": "hello"},
         }
+
+    def test_chatgpt_keeps_caller_capability_params(self):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="gpt-6.1-sol",
+            input="hi",
+            response_api_optional_request_params={
+                "parallel_tool_calls": False,
+                "text": {"verbosity": "high"},
+                "prompt_cache_key": "caller-key",
+                "service_tier": "priority",
+            },
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["parallel_tool_calls"] is False
+        assert request["text"] == {"verbosity": "high"}
+        assert request["prompt_cache_key"] == "caller-key"
+        assert request["service_tier"] == "priority"
+
+    def test_chatgpt_fills_codex_defaults_when_caller_sets_none(self):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="gpt-6.1-sol",
+            input="hi",
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(litellm_session_id="session-abc"),
+            headers={},
+        )
+
+        assert request["tool_choice"] == "auto"
+        assert request["parallel_tool_calls"] is True
+        assert request["text"] == {"verbosity": "low"}
+        assert request["prompt_cache_key"] == "session-abc"
 
     @pytest.mark.parametrize(
         ("model_name", "response_model"),
