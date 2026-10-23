@@ -13,6 +13,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 
 PARAMS_ADAPTER: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(Mapping[str, object])
+LOOSE_MAPPING_ADAPTER: Final[TypeAdapter[Mapping[object, object]]] = TypeAdapter(Mapping[object, object])
 
 # OAuth + API constants (derived from openai/codex)
 CHATGPT_AUTH_BASE: Final = "https://auth.openai.com"
@@ -253,7 +254,7 @@ def get_chatgpt_session_id(litellm_params: object) -> str | None:
             return str(value)
     metadata: Final = params.get("metadata")
     if isinstance(metadata, Mapping):
-        value = PARAMS_ADAPTER.validate_python(metadata).get("session_id")
-        if value:
-            return str(value)
+        session_id: Final = LOOSE_MAPPING_ADAPTER.validate_python(metadata).get("session_id")
+        if isinstance(session_id, str) and session_id:
+            return session_id
     return None

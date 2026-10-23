@@ -235,3 +235,9 @@ def test_conversation_identity_reaches_every_session_header():
     assert headers["session-id"] == "conv-1"
     assert headers["thread-id"] == "conv-1"
     assert headers["x-client-request-id"] == "conv-1"
+
+
+def test_session_lookup_tolerates_metadata_without_string_keys():
+    assert get_chatgpt_session_id({"metadata": {1: "tag"}}) is None
+    assert get_chatgpt_session_id({"metadata": {1: "tag", "session_id": "conv-1"}}) == "conv-1"
+    assert get_chatgpt_session_id({"metadata": {(1, 2): "tag"}}) is None

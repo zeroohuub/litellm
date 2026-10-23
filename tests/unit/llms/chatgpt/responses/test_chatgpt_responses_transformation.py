@@ -123,6 +123,49 @@ class TestChatGPTResponsesAPITransformation:
         assert headers["x-client-request-id"] == "session-123"
         assert "session_id" not in headers
 
+    def _auth_file(self, tmp_path):
+        auth_file = tmp_path / "auth.js"
+        auth_file.write_text(
+            json.dumps(
+                {
+                    "access_token": "access-123",
+                    "account_id": "acct-123",
+                    "expires_at": time.time() + 3600,
+                }
+            )
+        )
+        return auth_file
+
+    def test_validate_environment_omits_session_headers_without_identity(self, tmp_path):
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(api_key=str(self._auth_file(tmp_path)))
+
+        headers = config.validate_environment(
+            headers={},
+            model="gpt-6.1-sol",
+            litellm_params=litellm_params,
+        )
+
+        assert "session-id" not in headers
+        assert "thread-id" not in headers
+        assert "x-client-request-id" not in headers
+
+    def test_validate_environment_does_not_turn_a_trace_id_into_a_session_id(self, tmp_path):
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(
+            api_key=str(self._auth_file(tmp_path)),
+            litellm_trace_id="trace-1",
+        )
+
+        headers = config.validate_environment(
+            headers={},
+            model="gpt-6.1-sol",
+            litellm_params=litellm_params,
+        )
+
+        assert "session-id" not in headers
+        assert "trace-1" not in headers.values()
+
     @pytest.mark.parametrize(
         "model_name",
         [
