@@ -13,10 +13,27 @@ import pytest
 from botocore.credentials import Credentials
 from fastapi import Request
 from opentelemetry.trace import INVALID_SPAN, NonRecordingSpan, SpanContext
-from pydantic import TypeAdapter, ValidationError as PydanticValidationError
+from pydantic import TypeAdapter
+from pydantic import ValidationError as PydanticValidationError
 from starlette.datastructures import Headers
 
 import litellm
+from litellm.constants import (
+    ROUTER_USAGE_COUNTED_TOKENS_METADATA_KEY,
+    SESSION_ID_GENERATED_METADATA_KEY,
+    SESSION_ID_OMITTED_METADATA_KEY,
+)
+from litellm.litellm_core_utils.core_helpers import get_litellm_metadata_from_kwargs
+from litellm.litellm_core_utils.get_provider_specific_headers import (
+    ProviderSpecificHeaderUtils,
+)
+from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
+    TRUSTED_CALLBACK_VARS_FIELD,
+)
+from litellm.litellm_core_utils.internal_call_metadata import MODEL_ACCESS_GROUP_METADATA_KEY
+from litellm.litellm_core_utils.redact_messages import _get_turn_off_message_logging_from_dynamic_params
+from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
+from litellm.llms.fireworks_ai.common_utils import get_fireworks_session_id
 from litellm.proxy._types import AddTeamCallback, ProxyException, TeamCallbackMetadata, UserAPIKeyAuth
 from litellm.proxy.litellm_pre_call_utils import (
     KeyAndTeamLoggingSettings,
@@ -38,23 +55,7 @@ from litellm.proxy.litellm_pre_call_utils import (
     clean_headers,
     move_guardrails_to_metadata,
 )
-from litellm.litellm_core_utils.core_helpers import get_litellm_metadata_from_kwargs
 from litellm.proxy.spend_tracking.spend_tracking_utils import get_logging_payload
-from litellm.litellm_core_utils.internal_call_metadata import MODEL_ACCESS_GROUP_METADATA_KEY
-from litellm.litellm_core_utils.redact_messages import _get_turn_off_message_logging_from_dynamic_params
-from litellm.litellm_core_utils.get_provider_specific_headers import (
-    ProviderSpecificHeaderUtils,
-)
-from litellm.litellm_core_utils.initialize_dynamic_callback_params import (
-    TRUSTED_CALLBACK_VARS_FIELD,
-)
-from litellm.constants import (
-    ROUTER_USAGE_COUNTED_TOKENS_METADATA_KEY,
-    SESSION_ID_GENERATED_METADATA_KEY,
-    SESSION_ID_OMITTED_METADATA_KEY,
-)
-from litellm.llms.bedrock.base_aws_llm import BaseAWSLLM
-from litellm.llms.fireworks_ai.common_utils import get_fireworks_session_id
 from litellm.types.utils import CredentialItem
 
 
@@ -851,8 +852,13 @@ def test_initial_snapshot_refresh_clears_a_previous_guardrail_checkpoint() -> No
     from litellm.proxy.litellm_pre_call_utils import refresh_proxy_server_request_body_snapshot
 
     logging_obj: Final = Logging(
-        model="test-model", messages=[], stream=False, call_type="acompletion",
-        start_time=datetime.now(), litellm_call_id="new-request", function_id="new-request",
+        model="test-model",
+        messages=[],
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime.now(),
+        litellm_call_id="new-request",
+        function_id="new-request",
     )
     logging_obj.shadow_eval_request_snapshot = GuardrailRequestSnapshot.capture(
         {"messages": [{"role": "user", "content": "previous request"}]},
@@ -914,8 +920,14 @@ async def test_post_guardrail_snapshot_preserves_logging_only_masking_in_spend_l
     }
     data: Final = {"messages": messages, "metadata": metadata, "proxy_server_request": {}}
     logging_obj: Final = Logging(
-        model="test-model", messages=messages, stream=False, call_type="acompletion",
-        start_time=datetime.now(), litellm_call_id="mask-spend", function_id="mask-spend", kwargs=data,
+        model="test-model",
+        messages=messages,
+        stream=False,
+        call_type="acompletion",
+        start_time=datetime.now(),
+        litellm_call_id="mask-spend",
+        function_id="mask-spend",
+        kwargs=data,
     )
     data["litellm_logging_obj"] = logging_obj
     refresh_proxy_server_request_body_snapshot(data, guardrails_applied=True)
@@ -929,9 +941,13 @@ async def test_post_guardrail_snapshot_preserves_logging_only_masking_in_spend_l
     kwargs, _ = await guardrail.async_logging_hook(
         kwargs=logging_obj.model_call_details, result=None, call_type="acompletion"
     )
-    stored: Final = json.loads(_get_proxy_server_request_for_spend_logs_payload(
-        metadata={}, litellm_params=kwargs["litellm_params"], kwargs=kwargs,
-    ))
+    stored: Final = json.loads(
+        _get_proxy_server_request_for_spend_logs_payload(
+            metadata={},
+            litellm_params=kwargs["litellm_params"],
+            kwargs=kwargs,
+        )
+    )
 
     assert kwargs["messages"] == [{"role": "user", "content": "email [EMAIL]"}]
     assert stored["messages"] == kwargs["messages"]
@@ -2952,8 +2968,6 @@ def test_add_headers_to_llm_call_by_model_group_existing_headers_in_data():
         litellm.model_group_settings = original_model_group_settings
 
 
-from typing import Optional
-
 from fastapi.responses import Response
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -2964,7 +2978,7 @@ from litellm.types.utils import StandardLoggingPayload
 
 class TestCustomLogger(CustomLogger):
     def __init__(self):
-        self.standard_logging_object: Optional[StandardLoggingPayload] = None
+        self.standard_logging_object: StandardLoggingPayload | None = None
         super().__init__()
 
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
@@ -3472,7 +3486,9 @@ def test_get_chain_id_from_headers_codex_prefers_session_over_thread():
 
 @pytest.mark.parametrize("value", ("short", "has spaces!!", ""))
 @pytest.mark.parametrize("user_agent, header", ((CODEX_USER_AGENT, "session-id"), ("pi (browser)", "session_id")))
-def test_get_chain_id_from_headers_coding_agent_ignores_implausible_value(user_agent: str, header: str, value: str) -> None:
+def test_get_chain_id_from_headers_coding_agent_ignores_implausible_value(
+    user_agent: str, header: str, value: str
+) -> None:
     from litellm.proxy.litellm_pre_call_utils import get_chain_id_from_headers
 
     assert get_chain_id_from_headers({"user-agent": user_agent, header: value}) is None
@@ -5486,9 +5502,9 @@ async def test_team_guardrail_merges_with_global_policy():
     shadowed and non-default guardrails silently received an empty
     requested_guardrails list.
     """
+    from litellm.proxy.litellm_pre_call_utils import move_guardrails_to_metadata
     from litellm.proxy.policy_engine.attachment_registry import get_attachment_registry
     from litellm.proxy.policy_engine.policy_registry import get_policy_registry
-    from litellm.proxy.litellm_pre_call_utils import move_guardrails_to_metadata
     from litellm.types.proxy.policy_engine import (
         Policy,
         PolicyAttachment,
@@ -8604,20 +8620,27 @@ async def test_mcp_credentials_only_removed_from_logging_copies(path: str, custo
     request.headers = Headers(request.headers)
     settings: Final = {"mcp_client_side_auth_header_name": custom_auth, "user_header_name": "x-user-id"}
     server: Final = MCPServer(
-        server_id="header-test", name="header-test", transport="http", url="https://example.com/mcp",
+        server_id="header-test",
+        name="header-test",
+        transport="http",
+        url="https://example.com/mcp",
         extra_headers=["x-service-token", "x-user-id"],
     )
     with (
         patch("litellm.proxy.proxy_server.general_settings", settings),
         patch.dict(
             "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager.config_mcp_servers",
-            {"header-test": server}, clear=True,
+            {"header-test": server},
+            clear=True,
         ),
     ):
         updated: Final = await add_litellm_data_to_request(
             data={"model": "test-model", "messages": [{"role": "user", "content": "hello"}]},
-            request=request, user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
-            proxy_config=MagicMock(), general_settings=settings, version="test",
+            request=request,
+            user_api_key_dict=UserAPIKeyAuth(api_key="hashed-key"),
+            proxy_config=MagicMock(),
+            general_settings=settings,
+            version="test",
         )
     for header_dict in _all_header_dicts(updated, metadata_name):
         assert not any(value in json.dumps(header_dict) for value in secrets.values())
@@ -8637,7 +8660,10 @@ def test_signoz_callback_vars_are_scoped_to_the_signoz_callback():
         data=AddTeamCallback(
             callback_name="signoz",
             callback_type="success",
-            callback_vars={"signoz_ingestion_key": "team-key", "signoz_ingestion_endpoint": "https://ingest.eu.signoz.cloud:443"},
+            callback_vars={
+                "signoz_ingestion_key": "team-key",
+                "signoz_ingestion_endpoint": "https://ingest.eu.signoz.cloud:443",
+            },
         ),
         team_callback_settings_obj=None,
     )
